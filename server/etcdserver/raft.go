@@ -58,6 +58,7 @@ var (
 	raftStatus func() raft.Status
 )
 
+// f c
 func init() {
 	expvar.Publish("raft.status", expvar.Func(func() interface{} {
 		raftStatusMu.Lock()
