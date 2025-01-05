@@ -40,14 +40,16 @@ func notFoundErr(service, domain string) error {
 
 func TestConfigFileOtherFields(t *testing.T) {
 	ctls := securityConfig{TrustedCAFile: "cca", CertFile: "ccert", KeyFile: "ckey"}
-	ptls := securityConfig{TrustedCAFile: "pca", CertFile: "pcert", KeyFile: "pkey"}
+	// Note AllowedCN and AllowedHostname are mutually exclusive, this test is just to verify the fields can be correctly marshalled & unmarshalled.
+	ptls := securityConfig{TrustedCAFile: "pca", CertFile: "pcert", KeyFile: "pkey", AllowedCNs: []string{"etcd"}, AllowedHostnames: []string{"whatever.example.com"}}
 	yc := struct {
-		ClientSecurityCfgFile securityConfig `json:"client-transport-security"`
-		PeerSecurityCfgFile   securityConfig `json:"peer-transport-security"`
-		ForceNewCluster       bool           `json:"force-new-cluster"`
-		Logger                string         `json:"logger"`
-		LogOutputs            []string       `json:"log-outputs"`
-		Debug                 bool           `json:"debug"`
+		ClientSecurityCfgFile securityConfig       `json:"client-transport-security"`
+		PeerSecurityCfgFile   securityConfig       `json:"peer-transport-security"`
+		ForceNewCluster       bool                 `json:"force-new-cluster"`
+		Logger                string               `json:"logger"`
+		LogOutputs            []string             `json:"log-outputs"`
+		Debug                 bool                 `json:"debug"`
+		SocketOpts            transport.SocketOpts `json:"socket-options"`
 	}{
 		ctls,
 		ptls,
@@ -55,6 +57,9 @@ func TestConfigFileOtherFields(t *testing.T) {
 		"zap",
 		[]string{"/dev/null"},
 		false,
+		transport.SocketOpts{
+			ReusePort: true,
+		},
 	}
 
 	b, err := yaml.Marshal(&yc)
@@ -70,16 +75,18 @@ func TestConfigFileOtherFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !cfg.ForceNewCluster {
-		t.Errorf("ForceNewCluster = %v, want %v", cfg.ForceNewCluster, true)
-	}
-
 	if !ctls.equals(&cfg.ClientTLSInfo) {
 		t.Errorf("ClientTLS = %v, want %v", cfg.ClientTLSInfo, ctls)
 	}
 	if !ptls.equals(&cfg.PeerTLSInfo) {
 		t.Errorf("PeerTLS = %v, want %v", cfg.PeerTLSInfo, ptls)
 	}
+
+	assert.Equal(t, true, cfg.ForceNewCluster, "ForceNewCluster does not match")
+
+	assert.Equal(t, true, cfg.SocketOpts.ReusePort, "ReusePort does not match")
+
+	assert.Equal(t, false, cfg.SocketOpts.ReuseAddress, "ReuseAddress does not match")
 }
 
 // TestUpdateDefaultClusterFromName ensures that etcd can start with 'etcd --name=abc'.
@@ -149,7 +156,24 @@ func TestUpdateDefaultClusterFromNameOverwrite(t *testing.T) {
 func (s *securityConfig) equals(t *transport.TLSInfo) bool {
 	return s.CertFile == t.CertFile &&
 		s.CertAuth == t.ClientCertAuth &&
-		s.TrustedCAFile == t.TrustedCAFile
+		s.TrustedCAFile == t.TrustedCAFile &&
+		s.ClientCertFile == t.ClientCertFile &&
+		s.ClientKeyFile == t.ClientKeyFile &&
+		s.KeyFile == t.KeyFile &&
+		compareSlices(s.AllowedCNs, t.AllowedCNs) &&
+		compareSlices(s.AllowedHostnames, t.AllowedHostnames)
+}
+
+func compareSlices(slice1, slice2 []string) bool {
+	if len(slice1) != len(slice2) {
+		return false
+	}
+	for i, v := range slice1 {
+		if v != slice2[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func mustCreateCfgFile(t *testing.T, b []byte) *os.File {

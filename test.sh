@@ -50,6 +50,7 @@ source ./build.sh
 
 PASSES=${PASSES:-"fmt bom dep build unit"}
 PKG=${PKG:-}
+SHELLCHECK_VERSION=${SHELLCHECK_VERSION:-"v0.10.0"}
 
 if [ -z "${GOARCH:-}" ]; then
   GOARCH=$(go env GOARCH);
@@ -195,7 +196,7 @@ function functional_pass {
 
 function grpcproxy_pass {
   run_for_module "tests" go_test "./integration/... ./e2e" "fail_fast" : \
-      -timeout=30m -tags cluster_proxy "${COMMON_TEST_FLAGS[@]}" "$@"
+      -timeout=45m -tags cluster_proxy "${COMMON_TEST_FLAGS[@]}" "$@"
 }
 
 ################# COVERAGE #####################################################
@@ -393,9 +394,29 @@ function fmt_pass {
 }
 
 function shellcheck_pass {
-  if tool_exists "shellcheck" "https://github.com/koalaman/shellcheck#installing"; then
-    generic_checker run shellcheck -fgcc build test scripts/*.sh ./*.sh
+  SHELLCHECK=shellcheck
+  
+  if ! tool_exists "shellcheck" "https://github.com/koalaman/shellcheck#installing"; then
+    log_callout "Installing shellcheck $SHELLCHECK_VERSION"
+
+    if [ "$GOARCH" == "amd64" ]; then
+      URL="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+    elif [[ "$GOARCH" == "arm" || "$GOARCH" == "arm64" ]]; then
+      URL="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.aarch64.tar.xz"
+    else
+      echo "Unsupported architecture: $GOARCH"
+      exit 1
+    fi
+
+    wget -qO- "$URL" | tar -xJv -C /tmp/ --strip-components=1
+    mkdir -p ./bin
+    mv /tmp/shellcheck ./bin/
+    SHELLCHECK=./bin/shellcheck
   fi
+
+  echo "Running shellcheck with $SHELLCHECK"
+  generic_checker run ${SHELLCHECK} -fgcc build test scripts/*.sh ./*.sh
+
 }
 
 function shellws_pass {
@@ -610,20 +631,27 @@ function dump_deps_of_module() {
   if ! module=$(run go list -m); then
     return 255
   fi
-  run go list -f "{{if not .Indirect}}{{if .Version}}{{.Path}},{{.Version}},${module}{{end}}{{end}}" -m all
+  run go mod edit -json | jq -r '.Require[] | .Path+","+.Version+","+if .Indirect then " (indirect)" else "" end+",'"${module}"'"'
 }
 
 # Checks whether dependencies are consistent across modules
 function dep_pass {
   local all_dependencies
+  local tools_mod_dependencies
   all_dependencies=$(run_for_modules dump_deps_of_module | sort) || return 2
+  # tools/mod is a special case. It is a module that is not included in the
+  # module list from test_lib.sh. However, we need to ensure that the
+  # dependency versions match the rest of the project. Therefore, explicitly
+  # execute the command for tools/mod, and append its dependencies to the list.
+  tools_mod_dependencies=$(run_for_module "tools/mod" dump_deps_of_module "./...") || return 2
+  all_dependencies="${all_dependencies}"$'\n'"${tools_mod_dependencies}"
 
   local duplicates
   duplicates=$(echo "${all_dependencies}" | cut -d ',' -f 1,2 | sort | uniq | cut -d ',' -f 1 | sort | uniq -d) || return 2
 
   for dup in ${duplicates}; do
     log_error "FAIL: inconsistent versions for depencency: ${dup}"
-    echo "${all_dependencies}" | grep "${dup}" | sed "s|\\([^,]*\\),\\([^,]*\\),\\([^,]*\\)|  - \\1@\\2 from: \\3|g"
+    echo "${all_dependencies}" | grep "${dup}," | sed 's|\([^,]*\),\([^,]*\),\([^,]*\),\([^,]*\)|  - \1@\2\3 from: \4|g'
   done
   if [[ -n "${duplicates}" ]]; then
     log_error "FAIL: inconsistent dependencies"
@@ -635,8 +663,21 @@ function dep_pass {
 
 function release_pass {
   rm -f ./bin/etcd-last-release
-  # to grab latest patch release; bump this up for every minor release
-  UPGRADE_VER=$(git tag -l --sort=-version:refname "v3.4.*" | head -1)
+
+  # Work out the previous minor release based on the version reported by etcd binary
+  binary_version=$(./bin/etcd --version | grep --only-matching --perl-regexp '(?<=etcd Version: )\d+\.\d+')
+  binary_major=$(echo "${binary_version}" | cut -d '.' -f 1)
+  binary_minor=$(echo "${binary_version}" | cut -d '.' -f 2)
+  previous_minor=$((binary_minor - 1))
+
+  # This gets a list of all remote tags for the release branch in regex
+  # Sort key is used to sort numerically by patch version
+  # Latest version is then stored for use below
+  UPGRADE_VER=$(git ls-remote --tags https://github.com/etcd-io/etcd.git \
+    | grep --only-matching --perl-regexp "(?<=v)${binary_major}.${previous_minor}.[\d]+?(?=[\^])" \
+    | sort --numeric-sort --key 1.5 | tail -1 | sed 's/^/v/')
+  log_callout "Found latest release: ${UPGRADE_VER}."
+
   if [ -n "${MANUAL_VER:-}" ]; then
     # in case, we need to test against different version
     UPGRADE_VER=$MANUAL_VER
@@ -694,6 +735,10 @@ function mod_tidy_for_module {
 
 function mod_tidy_pass {
   run_for_modules mod_tidy_for_module
+}
+
+function toggle_failpoints_pass {
+  toggle_failpoints_default
 }
 
 ########### MAIN ###############################################################

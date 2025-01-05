@@ -40,6 +40,7 @@ import (
 	"go.etcd.io/etcd/server/v3/mvcc/buckets"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 )
 
 func TestStoreRev(t *testing.T) {
@@ -332,6 +333,8 @@ func TestStoreCompact(t *testing.T) {
 	fi.indexCompactRespc <- map[revision]struct{}{{1, 0}: {}}
 	key1 := newTestKeyBytes(revision{1, 0}, false)
 	key2 := newTestKeyBytes(revision{2, 0}, false)
+	b.tx.rangeRespc <- rangeResp{[][]byte{}, [][]byte{}}
+	b.tx.rangeRespc <- rangeResp{[][]byte{}, [][]byte{}}
 	b.tx.rangeRespc <- rangeResp{[][]byte{key1, key2}, [][]byte{[]byte("alice"), []byte("bob")}}
 
 	s.Compact(traceutil.TODO(), 3)
@@ -343,6 +346,8 @@ func TestStoreCompact(t *testing.T) {
 	end := make([]byte, 8)
 	binary.BigEndian.PutUint64(end, uint64(4))
 	wact := []testutil.Action{
+		{Name: "range", Params: []interface{}{buckets.Meta, scheduledCompactKeyName, []uint8(nil), int64(0)}},
+		{Name: "range", Params: []interface{}{buckets.Meta, finishedCompactKeyName, []uint8(nil), int64(0)}},
 		{Name: "put", Params: []interface{}{buckets.Meta, scheduledCompactKeyName, newTestRevBytes(revision{3, 0})}},
 		{Name: "range", Params: []interface{}{buckets.Key, make([]byte, 17), end, int64(10000)}},
 		{Name: "delete", Params: []interface{}{buckets.Key, key2}},
@@ -536,7 +541,7 @@ type hashKVResult struct {
 func TestHashKVWhenCompacting(t *testing.T) {
 	b, tmpPath := betesting.NewDefaultTmpBackend(t)
 	s := NewStore(zap.NewExample(), b, &lease.FakeLessor{}, StoreConfig{})
-	defer os.Remove(tmpPath)
+	defer cleanup(s, b, tmpPath)
 
 	rev := 10000
 	for i := 2; i <= rev; i++ {
@@ -544,9 +549,11 @@ func TestHashKVWhenCompacting(t *testing.T) {
 	}
 
 	hashCompactc := make(chan hashKVResult, 1)
-
-	donec := make(chan struct{})
 	var wg sync.WaitGroup
+	donec := make(chan struct{})
+	stopc := make(chan struct{})
+
+	// Call HashByRev(10000) in multiple goroutines until donec is closed
 	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
@@ -557,6 +564,8 @@ func TestHashKVWhenCompacting(t *testing.T) {
 					t.Error(err)
 				}
 				select {
+				case <-stopc:
+					return
 				case <-donec:
 					return
 				case hashCompactc <- hashKVResult{hash.Hash, hash.CompactRevision}:
@@ -565,10 +574,12 @@ func TestHashKVWhenCompacting(t *testing.T) {
 		}()
 	}
 
+	// Check computed hashes by HashByRev are correct in a goroutine, until donec is closed
+	wg.Add(1)
 	go func() {
-		defer close(donec)
+		defer wg.Done()
 		revHash := make(map[int64]uint32)
-		for round := 0; round < 1000; round++ {
+		for {
 			r := <-hashCompactc
 			if revHash[r.compactRev] == 0 {
 				revHash[r.compactRev] = r.hash
@@ -576,26 +587,85 @@ func TestHashKVWhenCompacting(t *testing.T) {
 			if r.hash != revHash[r.compactRev] {
 				t.Errorf("Hashes differ (current %v) != (saved %v)", r.hash, revHash[r.compactRev])
 			}
+
+			select {
+			case <-stopc:
+				return
+			case <-donec:
+				return
+			default:
+			}
 		}
 	}()
 
+	// Compact the store in a goroutine, using revision 9900 to 10000 and close donec when finished
 	wg.Add(1)
 	go func() {
-		defer wg.Done()
+		defer func() {
+			close(donec)
+			wg.Done()
+		}()
+
 		for i := 100; i >= 0; i-- {
-			_, err := s.Compact(traceutil.TODO(), int64(rev-1-i))
+			select {
+			case <-stopc:
+				return
+			default:
+			}
+
+			_, err := s.Compact(traceutil.TODO(), int64(rev-i))
 			if err != nil {
 				t.Error(err)
 			}
+			// Wait for the compaction job to finish
+			s.fifoSched.WaitFinish(1)
+			// Leave time for calls to HashByRev to take place after each compaction
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
 	select {
 	case <-donec:
-		wg.Wait()
 	case <-time.After(10 * time.Second):
+		close(stopc)
+		wg.Wait()
 		testutil.FatalStack(t, "timeout")
+	}
+
+	close(stopc)
+	wg.Wait()
+}
+
+// TestHashKVWithCompactedAndFutureRevisions ensures that HashKV returns a correct hash when called
+// with a past revision (lower than compacted), a future revision, and the exact compacted revision
+func TestHashKVWithCompactedAndFutureRevisions(t *testing.T) {
+	b, tmpPath := betesting.NewDefaultTmpBackend(t)
+	s := NewStore(zaptest.NewLogger(t), b, &lease.FakeLessor{}, StoreConfig{})
+	defer cleanup(s, b, tmpPath)
+
+	rev := 10000
+	compactRev := rev / 2
+
+	for i := 2; i <= rev; i++ {
+		s.Put([]byte("foo"), []byte(fmt.Sprintf("bar%d", i)), lease.NoLease)
+	}
+	if _, err := s.Compact(traceutil.TODO(), int64(compactRev)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, errFutureRev := s.HashStorage().HashByRev(int64(rev + 1))
+	if errFutureRev != ErrFutureRev {
+		t.Error(errFutureRev)
+	}
+
+	_, _, errPastRev := s.HashStorage().HashByRev(int64(compactRev - 1))
+	if errPastRev != ErrCompacted {
+		t.Error(errPastRev)
+	}
+
+	_, _, errCompactRev := s.HashStorage().HashByRev(int64(compactRev))
+	if errCompactRev != nil {
+		t.Error(errCompactRev)
 	}
 }
 
@@ -604,7 +674,7 @@ func TestHashKVWhenCompacting(t *testing.T) {
 func TestHashKVZeroRevision(t *testing.T) {
 	b, tmpPath := betesting.NewDefaultTmpBackend(t)
 	s := NewStore(zap.NewExample(), b, &lease.FakeLessor{}, StoreConfig{})
-	defer os.Remove(tmpPath)
+	defer cleanup(s, b, tmpPath)
 
 	rev := 10000
 	for i := 2; i <= rev; i++ {
@@ -840,7 +910,10 @@ func newFakeStore() *store {
 		Recorder:   &testutil.RecorderBuffered{},
 		rangeRespc: make(chan rangeResp, 5)}}
 	s := &store{
-		cfg:            StoreConfig{CompactionBatchLimit: 10000},
+		cfg: StoreConfig{
+			CompactionBatchLimit:    10000,
+			CompactionSleepInterval: defaultCompactionSleepInterval,
+		},
 		b:              b,
 		le:             &lease.FakeLessor{},
 		kvindex:        newFakeIndex(),

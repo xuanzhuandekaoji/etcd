@@ -37,6 +37,7 @@ clean:
 	rm -rf ./release
 	rm -rf ./coverage/*.err ./coverage/*.out
 	rm -rf ./tests/e2e/default.proxy
+	rm -rf ./bin/shellcheck*
 	find ./ -name "127.0.0.1:*" -o -name "localhost:*" -o -name "*.log" -o -name "agent-*" -o -name "*.coverprofile" -o -name "testname-proxy-*" | $(XARGS)
 
 docker-clean:
@@ -55,7 +56,7 @@ docker-remove:
 
 
 
-GO_VERSION ?= 1.19.9
+GO_VERSION ?= $(shell cat .go-version)
 ETCD_VERSION ?= $(shell git rev-parse --short HEAD || echo "GitNotFound")
 
 TEST_SUFFIX = $(shell date +%s | base64 | head -c 15)
@@ -155,11 +156,28 @@ test:
 
 test-smoke:
 	$(info log-file: test-$(TEST_SUFFIX).log)
-	PASSES="fmt build unit" ./test.sh 2<&1 | tee test-$(TEST_SUFFIX).log
+	PASSES="fmt bom dep build unit" ./test.sh 2<&1 | tee test-$(TEST_SUFFIX).log
+	! grep "FAIL:" test-$(TEST_SUFFIX).log
 
 test-full:
 	$(info log-file: test-$(TEST_SUFFIX).log)
 	PASSES="fmt build release unit integration functional e2e grpcproxy" ./test.sh 2<&1 | tee test-$(TEST_SUFFIX).log
+
+.PHONY: test-unit
+test-unit:
+	PASSES="unit" ./test.sh $(GO_TEST_FLAGS)
+
+.PHONY: test-integration
+test-integration:
+	PASSES="integration" ./test.sh $(GO_TEST_FLAGS)
+
+.PHONY: test-e2e
+test-e2e:
+	PASSES="build e2e" ./test.sh $(GO_TEST_FLAGS)
+
+.PHONY: test-e2e-release
+test-e2e-release:
+	PASSES="build release e2e" ./test.sh $(GO_TEST_FLAGS)
 
 ensure-docker-test-image-exists:
 	make pull-docker-test || ( echo "WARNING: Container Image not found in registry, building locally"; make build-docker-test )
@@ -549,3 +567,36 @@ pull-docker-functional:
 	$(info GO_VERSION: $(GO_VERSION))
 	$(info ETCD_VERSION: $(ETCD_VERSION))
 	docker pull gcr.io/etcd-development/etcd-functional:go$(GO_VERSION)
+
+# Failpoints
+GOFAIL_VERSION = $(shell cd tools/mod && go list -m -f {{.Version}} go.etcd.io/gofail)
+.PHONY: install-gofail
+install-gofail:
+	go install go.etcd.io/gofail@${GOFAIL_VERSION}
+
+.PHONY: gofail-enable
+gofail-enable: install-gofail
+	PASSES="toggle_failpoints" FAILPOINTS=true ./test.sh
+
+.PHONY: gofail-disable
+gofail-disable: install-gofail
+	PASSES="toggle_failpoints" ./test.sh
+
+.PHONY: verify
+verify: verify-go-versions verify-dep
+
+.PHONY: verify-go-versions
+verify-go-versions:
+	./scripts/verify_go_versions.sh
+
+.PHONY: verify-dep
+verify-dep:
+	PASSES="dep" ./test.sh 2<&1
+
+.PHONY: fix
+fix: sync-toolchain-directive
+	./scripts/fix.sh
+
+.PHONY: sync-toolchain-directive
+sync-toolchain-directive:
+	./scripts/sync_go_toolchain_directive.sh

@@ -23,14 +23,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/pkg/v3/expect"
+	"go.etcd.io/etcd/tests/v3/framework/e2e"
 )
 
 func TestGrpcProxyAutoSync(t *testing.T) {
-	skipInShortMode(t)
+	e2e.SkipInShortMode(t)
 
 	var (
 		node1Name      = "node1"
@@ -55,17 +57,17 @@ func TestGrpcProxyAutoSync(t *testing.T) {
 	require.NoError(t, err)
 
 	// Run grpc-proxy instance
-	proxyProc, err := spawnCmd([]string{binDir + "/etcd", "grpc-proxy", "start",
+	proxyProc, err := e2e.SpawnCmd([]string{e2e.BinDir + "/etcd", "grpc-proxy", "start",
 		"--advertise-client-url", proxyClientURL, "--listen-addr", proxyClientURL,
 		"--endpoints", node1ClientURL,
 		"--endpoints-auto-sync-interval", autoSyncInterval.String(),
 	}, nil)
 	require.NoError(t, err)
 
-	err = spawnWithExpect([]string{ctlBinPath, "--endpoints", proxyClientURL, "put", "k1", "v1"}, "OK")
+	err = e2e.SpawnWithExpect([]string{e2e.CtlBinPath, "--endpoints", proxyClientURL, "put", "k1", "v1"}, "OK")
 	require.NoError(t, err)
 
-	err = spawnWithExpect([]string{ctlBinPath, "--endpoints", node1ClientURL, "member", "add", node2Name, "--peer-urls", node2PeerURL}, "added")
+	err = e2e.SpawnWithExpect([]string{e2e.CtlBinPath, "--endpoints", node1ClientURL, "member", "add", node2Name, "--peer-urls", node2PeerURL}, "added")
 	require.NoError(t, err)
 
 	// Run new member
@@ -93,7 +95,7 @@ func TestGrpcProxyAutoSync(t *testing.T) {
 
 	// Second node could be not ready yet
 	for i := 0; i < 10; i++ {
-		err = spawnWithExpect([]string{ctlBinPath, "--endpoints", node2ClientURL, "member", "remove", fmt.Sprintf("%x", node1MemberID)}, "removed")
+		err = e2e.SpawnWithExpect([]string{e2e.CtlBinPath, "--endpoints", node2ClientURL, "member", "remove", fmt.Sprintf("%x", node1MemberID)}, "removed")
 		if err != nil && strings.Contains(err.Error(), rpctypes.ErrGRPCUnhealthy.Error()) {
 			time.Sleep(500 * time.Millisecond)
 			continue
@@ -111,7 +113,7 @@ func TestGrpcProxyAutoSync(t *testing.T) {
 	require.NoError(t, err)
 
 	for i := 0; i < 10; i++ {
-		err = spawnWithExpect([]string{ctlBinPath, "--endpoints", proxyClientURL, "get", "k1"}, "v1")
+		err = e2e.SpawnWithExpect([]string{e2e.CtlBinPath, "--endpoints", proxyClientURL, "get", "k1"}, "v1")
 		if err != nil && (strings.Contains(err.Error(), rpctypes.ErrGRPCLeaderChanged.Error()) ||
 			strings.Contains(err.Error(), context.DeadlineExceeded.Error())) {
 			time.Sleep(500 * time.Millisecond)
@@ -125,8 +127,40 @@ func TestGrpcProxyAutoSync(t *testing.T) {
 	require.NoError(t, proxyProc.Stop())
 }
 
+func TestGrpcProxyTLSVersions(t *testing.T) {
+	e2e.SkipInShortMode(t)
+
+	epc, err := e2e.NewEtcdProcessCluster(t, e2e.NewConfigClientBoth())
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, epc.Close())
+	}()
+
+	var (
+		node1ClientURL = epc.Procs[0].Config().ClientHttpUrl
+		proxyClientURL = "127.0.0.1:42379"
+	)
+
+	// Run independent grpc-proxy instance
+	proxyProc, err := e2e.SpawnCmd([]string{e2e.BinDir + "/etcd", "grpc-proxy", "start",
+		"--advertise-client-url", proxyClientURL,
+		"--listen-addr", proxyClientURL,
+		"--endpoints", node1ClientURL,
+		"--endpoints-auto-sync-interval", "1s",
+		"--cert-file", e2e.CertPath2,
+		"--key-file", e2e.PrivateKeyPath2,
+		"--tls-min-version", "TLS1.2",
+		"--tls-max-version", "TLS1.3",
+	}, nil)
+	require.NoError(t, err)
+	defer proxyProc.Stop()
+
+	_, err = proxyProc.Expect("listening for gRPC proxy client requests")
+	require.NoError(t, err)
+}
+
 func runEtcdNode(name, dataDir, clientURL, peerURL, clusterState, initialCluster string) (*expect.ExpectProcess, error) {
-	proc, err := spawnCmd([]string{binPath,
+	proc, err := e2e.SpawnCmd([]string{e2e.BinPath,
 		"--name", name,
 		"--data-dir", dataDir,
 		"--listen-client-urls", clientURL, "--advertise-client-urls", clientURL,
@@ -155,7 +189,7 @@ func findMemberIDByEndpoint(members []*etcdserverpb.Member, endpoint string) (ui
 }
 
 func getMemberListFromEndpoint(endpoint string) (etcdserverpb.MemberListResponse, error) {
-	proc, err := spawnCmd([]string{ctlBinPath, "--endpoints", endpoint, "member", "list", "--write-out", "json"}, nil)
+	proc, err := e2e.SpawnCmd([]string{e2e.CtlBinPath, "--endpoints", endpoint, "member", "list", "--write-out", "json"}, nil)
 	if err != nil {
 		return etcdserverpb.MemberListResponse{}, err
 	}

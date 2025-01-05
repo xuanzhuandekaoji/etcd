@@ -59,6 +59,9 @@ var (
 	grpcProxyMetricsListenAddr         string
 	grpcProxyEndpoints                 []string
 	grpcProxyEndpointsAutoSyncInterval time.Duration
+	grpcProxyDialKeepAliveTime         time.Duration
+	grpcProxyDialKeepAliveTimeout      time.Duration
+	grpcProxyPermitWithoutStream       bool
 	grpcProxyDNSCluster                string
 	grpcProxyDNSClusterServiceName     string
 	grpcProxyInsecureDiscovery         bool
@@ -75,13 +78,16 @@ var (
 
 	// tls for clients connecting to proxy
 
-	grpcProxyListenCA           string
-	grpcProxyListenCert         string
-	grpcProxyListenKey          string
-	grpcProxyListenCipherSuites []string
-	grpcProxyListenAutoTLS      bool
-	grpcProxyListenCRL          string
-	selfSignedCertValidity      uint
+	grpcProxyListenCA            string
+	grpcProxyListenCert          string
+	grpcProxyListenKey           string
+	grpcProxyListenCipherSuites  []string
+	grpcProxyListenAutoTLS       bool
+	grpcProxyListenCRL           string
+	grpcProxyListenTLSMinVersion string
+	grpcProxyListenTLSMaxVersion string
+
+	selfSignedCertValidity uint
 
 	grpcProxyAdvertiseClientURL string
 	grpcProxyResolverPrefix     string
@@ -134,6 +140,9 @@ func newGRPCProxyStartCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&grpcProxyInsecureDiscovery, "insecure-discovery", false, "accept insecure SRV records")
 	cmd.Flags().StringSliceVar(&grpcProxyEndpoints, "endpoints", []string{"127.0.0.1:2379"}, "comma separated etcd cluster endpoints")
 	cmd.Flags().DurationVar(&grpcProxyEndpointsAutoSyncInterval, "endpoints-auto-sync-interval", 0, "etcd endpoints auto sync interval (disabled by default)")
+	cmd.Flags().DurationVar(&grpcProxyDialKeepAliveTime, "dial-keepalive-time", 0, "keepalive time for client(grpc-proxy) connections (default 0, disable).")
+	cmd.Flags().DurationVar(&grpcProxyDialKeepAliveTimeout, "dial-keepalive-timeout", embed.DefaultGRPCKeepAliveTimeout, "keepalive timeout for client(grpc-proxy) connections (default 20s).")
+	cmd.Flags().BoolVar(&grpcProxyPermitWithoutStream, "permit-without-stream", false, "Enable client(grpc-proxy) to send keepalive pings even with no active RPCs.")
 	cmd.Flags().StringVar(&grpcProxyAdvertiseClientURL, "advertise-client-url", "127.0.0.1:23790", "advertise address to register (must be reachable by client)")
 	cmd.Flags().StringVar(&grpcProxyResolverPrefix, "resolver-prefix", "", "prefix to use for registering proxy (must be shared with other grpc-proxy members)")
 	cmd.Flags().IntVar(&grpcProxyResolverTTL, "resolver-ttl", 0, "specify TTL, in seconds, when registering proxy endpoints")
@@ -160,6 +169,8 @@ func newGRPCProxyStartCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&grpcProxyListenAutoTLS, "auto-tls", false, "proxy TLS using generated certificates")
 	cmd.Flags().StringVar(&grpcProxyListenCRL, "client-crl-file", "", "proxy client certificate revocation list file.")
 	cmd.Flags().UintVar(&selfSignedCertValidity, "self-signed-cert-validity", 1, "The validity period of the proxy certificates, unit is year")
+	cmd.Flags().StringVar(&grpcProxyListenTLSMinVersion, "tls-min-version", string(tlsutil.TLSVersion12), "Minimum TLS version supported by grpc proxy. Possible values: TLS1.2, TLS1.3.")
+	cmd.Flags().StringVar(&grpcProxyListenTLSMaxVersion, "tls-max-version", string(tlsutil.TLSVersionDefault), "Maximum TLS version supported by grpc proxy. Possible values: TLS1.2, TLS1.3 (empty defers to Go).")
 
 	// experimental flags
 	cmd.Flags().BoolVar(&grpcProxyEnableOrdering, "experimental-serializable-ordering", false, "Ensure serializable reads have monotonically increasing store revisions across endpoints.")
@@ -191,13 +202,6 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 	// The empty CN is required for grpcProxyCert.
 	// Please see https://github.com/etcd-io/etcd/issues/11970#issuecomment-687875315  for more context.
 	tlsInfo := newTLS(grpcProxyListenCA, grpcProxyListenCert, grpcProxyListenKey, false)
-	if len(grpcProxyListenCipherSuites) > 0 {
-		cs, err := tlsutil.GetCipherSuites(grpcProxyListenCipherSuites)
-		if err != nil {
-			log.Fatal(err)
-		}
-		tlsInfo.CipherSuites = cs
-	}
 	if tlsInfo == nil && grpcProxyListenAutoTLS {
 		host := []string{"https://" + grpcProxyListenAddr}
 		dir := filepath.Join(grpcProxyDataDir, "fixtures", "proxy")
@@ -207,10 +211,32 @@ func startGRPCProxy(cmd *cobra.Command, args []string) {
 		}
 		tlsInfo = &autoTLS
 	}
-
 	if tlsInfo != nil {
+		if len(grpcProxyListenCipherSuites) > 0 {
+			cs, err := tlsutil.GetCipherSuites(grpcProxyListenCipherSuites)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tlsInfo.CipherSuites = cs
+		}
+		if grpcProxyListenTLSMinVersion != "" {
+			version, err := tlsutil.GetTLSVersion(grpcProxyListenTLSMinVersion)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tlsInfo.MinVersion = version
+		}
+		if grpcProxyListenTLSMaxVersion != "" {
+			version, err := tlsutil.GetTLSVersion(grpcProxyListenTLSMaxVersion)
+			if err != nil {
+				log.Fatal(err)
+			}
+			tlsInfo.MaxVersion = version
+		}
+
 		lg.Info("gRPC proxy server TLS", zap.String("tls-info", fmt.Sprintf("%+v", tlsInfo)))
 	}
+
 	m := mustListenCMux(lg, tlsInfo)
 	grpcl := m.Match(cmux.HTTP2())
 	defer func() {
@@ -282,6 +308,29 @@ func checkArgs() {
 	}
 	if grpcProxyListenAutoTLS && selfSignedCertValidity == 0 {
 		fmt.Fprintln(os.Stderr, fmt.Errorf("selfSignedCertValidity is invalid,it should be greater than 0"))
+		os.Exit(1)
+	}
+
+	minVersion, err := tlsutil.GetTLSVersion(grpcProxyListenTLSMinVersion)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("tls-min-version is invalid: %w", err))
+		os.Exit(1)
+	}
+	maxVersion, err := tlsutil.GetTLSVersion(grpcProxyListenTLSMaxVersion)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("tls-max-version is invalid: %w", err))
+		os.Exit(1)
+	}
+
+	// maxVersion == 0 means that Go selects the highest available version.
+	if maxVersion != 0 && minVersion > maxVersion {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("min version (%s) is greater than max version (%s)", grpcProxyListenTLSMinVersion, grpcProxyListenTLSMaxVersion))
+		os.Exit(1)
+	}
+
+	// Check if user attempted to configure ciphers for TLS1.3 only: Go does not support that currently.
+	if minVersion == tls.VersionTLS13 && len(grpcProxyListenCipherSuites) > 0 {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("cipher suites cannot be configured when only TLS1.3 is enabled"))
 		os.Exit(1)
 	}
 }
@@ -356,6 +405,13 @@ func newClientCfg(lg *zap.Logger, eps []string) (*clientv3.Config, error) {
 	if grpcMaxCallRecvMsgSize > 0 {
 		cfg.MaxCallRecvMsgSize = grpcMaxCallRecvMsgSize
 	}
+	if grpcProxyDialKeepAliveTime > 0 {
+		cfg.DialKeepAliveTime = grpcProxyDialKeepAliveTime
+	}
+	if grpcProxyDialKeepAliveTimeout > 0 {
+		cfg.DialKeepAliveTimeout = grpcProxyDialKeepAliveTimeout
+	}
+	cfg.PermitWithoutStream = grpcProxyPermitWithoutStream
 
 	tls := newTLS(grpcProxyCA, grpcProxyCert, grpcProxyKey, true)
 	if tls == nil && grpcProxyInsecureSkipTLSVerify {

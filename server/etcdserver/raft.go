@@ -84,7 +84,9 @@ type apply struct {
 type raftNode struct {
 	lg *zap.Logger
 
-	tickMu *sync.Mutex
+	tickMu *sync.RWMutex
+	// timestamp of the latest tick
+	latestTickTs time.Time
 	raftNodeConfig
 
 	// a chan to send/receive snapshot
@@ -136,8 +138,9 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 	raft.SetLogger(lg)
 	r := &raftNode{
 		lg:             cfg.lg,
-		tickMu:         new(sync.Mutex),
+		tickMu:         new(sync.RWMutex),
 		raftNodeConfig: cfg,
+		latestTickTs:   time.Now(),
 		// set up contention detectors for raft heartbeat message.
 		// expect to send a heartbeat within 2 heartbeat intervals.
 		td:         contention.NewTimeoutDetector(2 * cfg.heartbeat),
@@ -159,7 +162,14 @@ func newRaftNode(cfg raftNodeConfig) *raftNode {
 func (r *raftNode) tick() {
 	r.tickMu.Lock()
 	r.Tick()
+	r.latestTickTs = time.Now()
 	r.tickMu.Unlock()
+}
+
+func (r *raftNode) getLatestTickTs() time.Time {
+	r.tickMu.RLock()
+	defer r.tickMu.RUnlock()
+	return r.latestTickTs
 }
 
 // start prepares and starts raftNode in a new goroutine. It is no longer safe

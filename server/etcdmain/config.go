@@ -36,6 +36,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+const deprecatedWarningMessage = "--%s is deprecated in 3.5 and will be decommissioned in 3.6."
+
 var (
 	proxyFlagOff      = "off"
 	proxyFlagReadonly = "readonly"
@@ -61,6 +63,17 @@ var (
 		// for coverage testing
 		"test.coverprofile",
 		"test.outputdir",
+	}
+
+	deprecatedFlags = map[string]struct{}{
+		"enable-v2":                struct{}{},
+		"experimental-enable-v2v3": struct{}{},
+		"proxy":                    struct{}{},
+		"proxy-failure-wait":       struct{}{},
+		"proxy-refresh-interval":   struct{}{},
+		"proxy-dial-timeout":       struct{}{},
+		"proxy-write-timeout":      struct{}{},
+		"proxy-read-timeout":       struct{}{},
 	}
 )
 
@@ -207,17 +220,17 @@ func newConfig() *config {
 
 	fs.BoolVar(&cfg.ec.PreVote, "pre-vote", cfg.ec.PreVote, "Enable to run an additional Raft election phase.")
 
-	fs.BoolVar(&cfg.ec.EnableV2, "enable-v2", cfg.ec.EnableV2, "Accept etcd V2 client requests. Deprecated in v3.5. Will be decommission in v3.6.")
-	fs.StringVar(&cfg.ec.ExperimentalEnableV2V3, "experimental-enable-v2v3", cfg.ec.ExperimentalEnableV2V3, "v3 prefix for serving emulated v2 state. Deprecated in 3.5. Will be decomissioned in 3.6.")
+	fs.BoolVar(&cfg.ec.EnableV2, "enable-v2", cfg.ec.EnableV2, "Accept etcd V2 client requests. Deprecated in v3.5 and will be decommissioned in v3.6.")
+	fs.StringVar(&cfg.ec.ExperimentalEnableV2V3, "experimental-enable-v2v3", cfg.ec.ExperimentalEnableV2V3, "v3 prefix for serving emulated v2 state. Deprecated in 3.5 and will be decommissioned in 3.6.")
 	fs.Var(cfg.cf.v2deprecation, "v2-deprecation", fmt.Sprintf("v2store deprecation stage: %q. ", cfg.cf.proxy.Valids()))
 
 	// proxy
 	fs.Var(cfg.cf.proxy, "proxy", fmt.Sprintf("Valid values include %q", cfg.cf.proxy.Valids()))
-	fs.UintVar(&cfg.cp.ProxyFailureWaitMs, "proxy-failure-wait", cfg.cp.ProxyFailureWaitMs, "Time (in milliseconds) an endpoint will be held in a failed state.")
-	fs.UintVar(&cfg.cp.ProxyRefreshIntervalMs, "proxy-refresh-interval", cfg.cp.ProxyRefreshIntervalMs, "Time (in milliseconds) of the endpoints refresh interval.")
-	fs.UintVar(&cfg.cp.ProxyDialTimeoutMs, "proxy-dial-timeout", cfg.cp.ProxyDialTimeoutMs, "Time (in milliseconds) for a dial to timeout.")
-	fs.UintVar(&cfg.cp.ProxyWriteTimeoutMs, "proxy-write-timeout", cfg.cp.ProxyWriteTimeoutMs, "Time (in milliseconds) for a write to timeout.")
-	fs.UintVar(&cfg.cp.ProxyReadTimeoutMs, "proxy-read-timeout", cfg.cp.ProxyReadTimeoutMs, "Time (in milliseconds) for a read to timeout.")
+	fs.UintVar(&cfg.cp.ProxyFailureWaitMs, "proxy-failure-wait", cfg.cp.ProxyFailureWaitMs, "Time (in milliseconds) an endpoint will be held in a failed state. Deprecated in 3.5 and will be decommissioned in 3.6.")
+	fs.UintVar(&cfg.cp.ProxyRefreshIntervalMs, "proxy-refresh-interval", cfg.cp.ProxyRefreshIntervalMs, "Time (in milliseconds) of the endpoints refresh interval. Deprecated in 3.5 and will be decommissioned in 3.6.")
+	fs.UintVar(&cfg.cp.ProxyDialTimeoutMs, "proxy-dial-timeout", cfg.cp.ProxyDialTimeoutMs, "Time (in milliseconds) for a dial to timeout. Deprecated in 3.5 and will be decommissioned in 3.6.")
+	fs.UintVar(&cfg.cp.ProxyWriteTimeoutMs, "proxy-write-timeout", cfg.cp.ProxyWriteTimeoutMs, "Time (in milliseconds) for a write to timeout. Deprecated in 3.5 and will be decommissioned in 3.6.")
+	fs.UintVar(&cfg.cp.ProxyReadTimeoutMs, "proxy-read-timeout", cfg.cp.ProxyReadTimeoutMs, "Time (in milliseconds) for a read to timeout. Deprecated in 3.5 and will be decommissioned in 3.6.")
 
 	// security
 	fs.StringVar(&cfg.ec.ClientTLSInfo.CertFile, "cert-file", "", "Path to the client server TLS cert file.")
@@ -226,7 +239,7 @@ func newConfig() *config {
 	fs.StringVar(&cfg.ec.ClientTLSInfo.ClientKeyFile, "client-key-file", "", "Path to an explicit peer client TLS key file otherwise key file will be used when client auth is required.")
 	fs.BoolVar(&cfg.ec.ClientTLSInfo.ClientCertAuth, "client-cert-auth", false, "Enable client cert authentication.")
 	fs.StringVar(&cfg.ec.ClientTLSInfo.CRLFile, "client-crl-file", "", "Path to the client certificate revocation list file.")
-	fs.StringVar(&cfg.ec.ClientTLSInfo.AllowedHostname, "client-cert-allowed-hostname", "", "Allowed TLS hostname for client cert authentication.")
+	fs.Var(flags.NewStringsValue(""), "client-cert-allowed-hostname", "Comma-separated list of allowed SAN hostnames for client cert authentication.")
 	fs.StringVar(&cfg.ec.ClientTLSInfo.TrustedCAFile, "trusted-ca-file", "", "Path to the client server TLS trusted CA cert file.")
 	fs.BoolVar(&cfg.ec.ClientAutoTLS, "auto-tls", false, "Client TLS using generated certificates")
 	fs.StringVar(&cfg.ec.PeerTLSInfo.CertFile, "peer-cert-file", "", "Path to the peer server TLS cert file.")
@@ -238,8 +251,8 @@ func newConfig() *config {
 	fs.BoolVar(&cfg.ec.PeerAutoTLS, "peer-auto-tls", false, "Peer TLS using generated certificates")
 	fs.UintVar(&cfg.ec.SelfSignedCertValidity, "self-signed-cert-validity", 1, "The validity period of the client and peer certificates, unit is year")
 	fs.StringVar(&cfg.ec.PeerTLSInfo.CRLFile, "peer-crl-file", "", "Path to the peer certificate revocation list file.")
-	fs.StringVar(&cfg.ec.PeerTLSInfo.AllowedCN, "peer-cert-allowed-cn", "", "Allowed CN for inter peer authentication.")
-	fs.StringVar(&cfg.ec.PeerTLSInfo.AllowedHostname, "peer-cert-allowed-hostname", "", "Allowed TLS hostname for inter peer authentication.")
+	fs.Var(flags.NewStringsValue(""), "peer-cert-allowed-cn", "Comma-separated list of allowed CNs for inter-peer TLS authentication.")
+	fs.Var(flags.NewStringsValue(""), "peer-cert-allowed-hostname", "Comma-separated list of allowed SAN hostnames for inter-peer TLS authentication.")
 	fs.Var(flags.NewStringsValue(""), "cipher-suites", "Comma-separated list of supported TLS cipher suites between client/server and peers (empty will be auto-populated by Go).")
 	fs.BoolVar(&cfg.ec.PeerTLSInfo.SkipClientSANVerify, "experimental-peer-skip-client-san-verification", false, "Skip verification of SAN field in client certificate for peer connections.")
 	fs.StringVar(&cfg.ec.TlsMinVersion, "tls-min-version", string(tlsutil.TLSVersion12), "Minimum TLS version supported by etcd. Possible values: TLS1.2, TLS1.3.")
@@ -276,6 +289,7 @@ func newConfig() *config {
 	fs.StringVar(&cfg.ec.ExperimentalDistributedTracingAddress, "experimental-distributed-tracing-address", embed.ExperimentalDistributedTracingAddress, "Address for distributed tracing used for OpenTelemetry Tracing (if enabled with experimental-enable-distributed-tracing flag).")
 	fs.StringVar(&cfg.ec.ExperimentalDistributedTracingServiceName, "experimental-distributed-tracing-service-name", embed.ExperimentalDistributedTracingServiceName, "Configures service name for distributed tracing to be used to define service name for OpenTelemetry Tracing (if enabled with experimental-enable-distributed-tracing flag). 'etcd' is the default service name. Use the same service name for all instances of etcd.")
 	fs.StringVar(&cfg.ec.ExperimentalDistributedTracingServiceInstanceID, "experimental-distributed-tracing-instance-id", "", "Configures service instance ID for distributed tracing to be used to define service instance ID key for OpenTelemetry Tracing (if enabled with experimental-enable-distributed-tracing flag). There is no default value set. This ID must be unique per etcd instance.")
+	fs.IntVar(&cfg.ec.ExperimentalDistributedTracingSamplingRatePerMillion, "experimental-distributed-tracing-sampling-rate", 0, "Number of samples to collect per million spans for OpenTelemetry Tracing (if enabled with experimental-enable-distributed-tracing flag).")
 
 	// auth
 	fs.StringVar(&cfg.ec.AuthToken, "auth-token", cfg.ec.AuthToken, "Specify auth token specific options.")
@@ -295,12 +309,15 @@ func newConfig() *config {
 	// TODO: delete in v3.7
 	fs.BoolVar(&cfg.ec.ExperimentalEnableLeaseCheckpointPersist, "experimental-enable-lease-checkpoint-persist", false, "Enable persisting remainingTTL to prevent indefinite auto-renewal of long lived leases. Always enabled in v3.6. Should be used to ensure smooth upgrade from v3.5 clusters with this feature enabled. Requires experimental-enable-lease-checkpoint to be enabled.")
 	fs.IntVar(&cfg.ec.ExperimentalCompactionBatchLimit, "experimental-compaction-batch-limit", cfg.ec.ExperimentalCompactionBatchLimit, "Sets the maximum revisions deleted in each compaction batch.")
+	fs.DurationVar(&cfg.ec.ExperimentalCompactionSleepInterval, "experimental-compaction-sleep-interval", cfg.ec.ExperimentalCompactionSleepInterval, "Sets the sleep interval between each compaction batch.")
 	fs.DurationVar(&cfg.ec.ExperimentalWatchProgressNotifyInterval, "experimental-watch-progress-notify-interval", cfg.ec.ExperimentalWatchProgressNotifyInterval, "Duration of periodic watch progress notifications.")
 	fs.DurationVar(&cfg.ec.ExperimentalDowngradeCheckTime, "experimental-downgrade-check-time", cfg.ec.ExperimentalDowngradeCheckTime, "Duration of time between two downgrade status check.")
 	fs.DurationVar(&cfg.ec.ExperimentalWarningApplyDuration, "experimental-warning-apply-duration", cfg.ec.ExperimentalWarningApplyDuration, "Time duration after which a warning is generated if request takes more time.")
 	fs.BoolVar(&cfg.ec.ExperimentalMemoryMlock, "experimental-memory-mlock", cfg.ec.ExperimentalMemoryMlock, "Enable to enforce etcd pages (in particular bbolt) to stay in RAM.")
 	fs.BoolVar(&cfg.ec.ExperimentalTxnModeWriteWithSharedBuffer, "experimental-txn-mode-write-with-shared-buffer", true, "Enable the write transaction to use a shared buffer in its readonly check operations.")
+	fs.BoolVar(&cfg.ec.ExperimentalStopGRPCServiceOnDefrag, "experimental-stop-grpc-service-on-defrag", cfg.ec.ExperimentalStopGRPCServiceOnDefrag, "Enable etcd gRPC service to stop serving client requests on defragmentation.")
 	fs.UintVar(&cfg.ec.ExperimentalBootstrapDefragThresholdMegabytes, "experimental-bootstrap-defrag-threshold-megabytes", 0, "Enable the defrag during etcd server bootstrap on condition that it will free at least the provided threshold of disk space. Needs to be set to non-zero value to take effect.")
+	fs.Uint64Var(&cfg.ec.SnapshotCatchUpEntries, "experimental-snapshot-catchup-entries", cfg.ec.SnapshotCatchUpEntries, "(WARNING: Use this flag with caution!) Number of entries for a slow follower to catch up after compacting the raft storage entries.")
 
 	// unsafe
 	fs.BoolVar(&cfg.ec.UnsafeNoFsync, "unsafe-no-fsync", false, "Disables fsync, unsafe, will cause data loss.")
@@ -360,6 +377,20 @@ func (cfg *config) parse(arguments []string) error {
 		cfg.ec.V2Deprecation = cconfig.V2_DEPR_DEFAULT
 	}
 
+	var warningsForDeprecatedFlags []string
+	cfg.cf.flagSet.Visit(func(f *flag.Flag) {
+		if _, ok := deprecatedFlags[f.Name]; ok {
+			warningsForDeprecatedFlags = append(warningsForDeprecatedFlags, fmt.Sprintf(deprecatedWarningMessage, f.Name))
+		}
+	})
+	if len(warningsForDeprecatedFlags) > 0 {
+		if lg := cfg.ec.GetLogger(); lg != nil {
+			for _, msg := range warningsForDeprecatedFlags {
+				lg.Warn(msg)
+			}
+		}
+	}
+
 	// now logger is set up
 	return err
 }
@@ -405,6 +436,10 @@ func (cfg *config) configFromCmdLine() error {
 
 	cfg.ec.CORS = flags.UniqueURLsMapFromFlag(cfg.cf.flagSet, "cors")
 	cfg.ec.HostWhitelist = flags.UniqueStringsMapFromFlag(cfg.cf.flagSet, "host-whitelist")
+
+	cfg.ec.ClientTLSInfo.AllowedHostnames = flags.StringsFromFlag(cfg.cf.flagSet, "client-cert-allowed-hostname")
+	cfg.ec.PeerTLSInfo.AllowedCNs = flags.StringsFromFlag(cfg.cf.flagSet, "peer-cert-allowed-cn")
+	cfg.ec.PeerTLSInfo.AllowedHostnames = flags.StringsFromFlag(cfg.cf.flagSet, "peer-cert-allowed-hostname")
 
 	cfg.ec.CipherSuites = flags.StringsFromFlag(cfg.cf.flagSet, "cipher-suites")
 
